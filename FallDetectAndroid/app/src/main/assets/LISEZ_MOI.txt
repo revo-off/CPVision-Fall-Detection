@@ -1,0 +1,1 @@
+app/src/main/assets/ : copiez ici model.tflite (voir README.md)
