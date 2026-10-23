@@ -78,10 +78,13 @@ class YoloDetector(
     private var inType = DataType.FLOAT32
     private var inScale = 0f
     private var inZero = 0
+    private var inChannelFirst = false   // true : entrée NCHW [1,3,H,W]
     private lateinit var inBuf: ByteBuffer
 
     // --- Sortie ---
     private var outRows = 0
+    private var outCols = 0            // nb de valeurs par détection (6 en end-to-end, 4+nb classes en brut)
+    private var rawChannelFirst = false // true : sortie brute [1, 4+nc, N] (export end2end=False)
     private var outType = DataType.FLOAT32
     private var outScale = 0f
     private var outZero = 0
@@ -135,11 +138,17 @@ class YoloDetector(
     private fun setupTensors(it: InterpreterApi) {
         val inT = it.getInputTensor(0)
         val inShape = inT.shape()
-        require(inShape.size == 4 && inShape[3] == 3) {
-            "Entrée inattendue ${inShape.contentToString()} (attendu NHWC [1,H,W,3])"
+        require(inShape.size == 4 && (inShape[3] == 3 || inShape[1] == 3)) {
+            "Entrée inattendue ${inShape.contentToString()} (attendu NHWC [1,H,W,3] ou NCHW [1,3,H,W])"
         }
-        inH = inShape[1]
-        inW = inShape[2]
+        inChannelFirst = inShape[3] != 3
+        if (inChannelFirst) {
+            inH = inShape[2]
+            inW = inShape[3]
+        } else {
+            inH = inShape[1]
+            inW = inShape[2]
+        }
         inType = inT.dataType()
         inScale = inT.quantizationParams().scale
         inZero = inT.quantizationParams().zeroPoint
@@ -147,21 +156,29 @@ class YoloDetector(
 
         val outT = it.getOutputTensor(0)
         val outShape = outT.shape()
-        require(outShape.size == 3 && outShape[2] == 6) {
-            "Sortie inattendue ${outShape.contentToString()} : attendu [1,N,6] (modèle end-to-end). " +
-                "Réexportez sans end2end=False."
+        require(outShape.size == 3 && outShape[1] >= 5 && outShape[2] >= 5) {
+            "Sortie inattendue ${outShape.contentToString()} : attendu [1,N,6] ou [1,4+nc,N]"
         }
-        outRows = outShape[1]
+        // [1,6,8400] (brut, channel-first) vs [1,300,6] (end-to-end)
+        rawChannelFirst = outShape[1] < outShape[2]
+        if (rawChannelFirst) {
+            outCols = outShape[1]
+            outRows = outShape[2]
+        } else {
+            outRows = outShape[1]
+            outCols = outShape[2]
+        }
         outType = outT.dataType()
         outScale = outT.quantizationParams().scale
         outZero = outT.quantizationParams().zeroPoint
         outBuf = ByteBuffer.allocateDirect(outT.numBytes()).order(ByteOrder.nativeOrder())
-        outValues = FloatArray(outRows * 6)
+        outValues = FloatArray(outRows * outCols)
 
         letter = Bitmap.createBitmap(inW, inH, Bitmap.Config.ARGB_8888)
         letterCanvas = Canvas(letter)
         pixels = IntArray(inW * inH)
-        inputLabel = "${inW}x$inH ${inType.name.lowercase()}"
+        inputLabel = "${inW}x$inH ${inType.name.lowercase()}${if (inChannelFirst) " NCHW" else ""}"
+        Log.d(TAG, "Décodage : ${if (rawChannelFirst) "brut channel-first + NMS" else "end-to-end"}")
         Log.d(TAG, "Entrée ${inShape.contentToString()} $inType (scale=$inScale zp=$inZero) | " +
             "Sortie ${outShape.contentToString()} $outType (scale=$outScale zp=$outZero)")
     }
@@ -213,18 +230,28 @@ class YoloDetector(
             DataType.FLOAT32 -> {
                 val fb = inBuf.asFloatBuffer()
                 val inv = 1f / 255f
-                for (p in pixels) {
-                    fb.put(((p shr 16) and 0xFF) * inv)
-                    fb.put(((p shr 8) and 0xFF) * inv)
-                    fb.put((p and 0xFF) * inv)
+                if (inChannelFirst) {
+                    for (shift in intArrayOf(16, 8, 0))
+                        for (p in pixels) fb.put(((p shr shift) and 0xFF) * inv)
+                } else {
+                    for (p in pixels) {
+                        fb.put(((p shr 16) and 0xFF) * inv)
+                        fb.put(((p shr 8) and 0xFF) * inv)
+                        fb.put((p and 0xFF) * inv)
+                    }
                 }
             }
             DataType.UINT8, DataType.INT8 -> {
                 val signed = inType == DataType.INT8
-                for (p in pixels) {
-                    inBuf.put(quantize((p shr 16) and 0xFF, signed))
-                    inBuf.put(quantize((p shr 8) and 0xFF, signed))
-                    inBuf.put(quantize(p and 0xFF, signed))
+                if (inChannelFirst) {
+                    for (shift in intArrayOf(16, 8, 0))
+                        for (p in pixels) inBuf.put(quantize((p shr shift) and 0xFF, signed))
+                } else {
+                    for (p in pixels) {
+                        inBuf.put(quantize((p shr 16) and 0xFF, signed))
+                        inBuf.put(quantize((p shr 8) and 0xFF, signed))
+                        inBuf.put(quantize(p and 0xFF, signed))
+                    }
                 }
             }
             else -> error("Type d'entrée non géré : $inType")
@@ -259,6 +286,84 @@ class YoloDetector(
 
     private fun decode(thr: Float, fw: Int, fh: Int, scale: Float, padX: Float, padY: Float): List<Detection> {
         readOutput()
+        return if (rawChannelFirst) decodeRaw(thr, fw, fh, scale, padX, padY)
+        else decodeEndToEnd(thr, fw, fh, scale, padX, padY)
+    }
+
+    /** Sortie brute [1, 4+nc, N] : cx,cy,w,h puis un score par classe. NMS appliqué ici. */
+    private fun decodeRaw(thr: Float, fw: Int, fh: Int, scale: Float, padX: Float, padY: Float): List<Detection> {
+        val v = outValues
+        val n = outRows
+        val nc = outCols - 4
+
+        // 1) candidats au-dessus du seuil : [cx, cy, w, h, score, classe] (repère letterbox, pixels)
+        val cand = ArrayList<FloatArray>()
+        var maxCoord = 0f
+        for (i in 0 until n) {
+            var best = -1
+            var bestScore = thr
+            for (c in 0 until nc) {
+                val sc = v[(4 + c) * n + i]
+                if (sc >= bestScore) { bestScore = sc; best = c }
+            }
+            if (best < 0) continue
+            val box = FloatArray(6)
+            for (k in 0..3) {
+                box[k] = v[k * n + i]
+                maxCoord = max(maxCoord, box[k])
+            }
+            box[4] = bestScore
+            box[5] = best.toFloat()
+            cand.add(box)
+        }
+        if (cand.isEmpty()) return emptyList()
+
+        val normalized = maxCoord <= 1.5f
+        val sx = if (normalized) inW.toFloat() else 1f
+        val sy = if (normalized) inH.toFloat() else 1f
+        for (b in cand) {
+            b[0] *= sx; b[1] *= sy; b[2] *= sx; b[3] *= sy
+        }
+
+        // 2) NMS par classe
+        cand.sortByDescending { it[4] }
+        val kept = ArrayList<FloatArray>()
+        for (b in cand) {
+            if (kept.none { it[5] == b[5] && iou(it, b) > 0.45f }) kept.add(b)
+            if (kept.size >= 50) break
+        }
+
+        // 3) repère letterbox -> image affichée normalisée
+        val res = ArrayList<Detection>()
+        for (b in kept) {
+            val l = ((b[0] - b[2] / 2f - padX) / scale / fw).coerceIn(0f, 1f)
+            val t = ((b[1] - b[3] / 2f - padY) / scale / fh).coerceIn(0f, 1f)
+            val r = ((b[0] + b[2] / 2f - padX) / scale / fw).coerceIn(0f, 1f)
+            val bt = ((b[1] + b[3] / 2f - padY) / scale / fh).coerceIn(0f, 1f)
+            if (r - l < 0.005f || bt - t < 0.005f) continue
+            if (!loggedOnce) {
+                loggedOnce = true
+                Log.d(TAG, "1re détection brute : ${b.joinToString()} (normalisé=$normalized)")
+            }
+            res.add(Detection(b[5].toInt(), b[4], l, t, r, bt))
+        }
+        return res
+    }
+
+    private fun iou(a: FloatArray, b: FloatArray): Float {
+        val ax1 = a[0] - a[2] / 2f; val ay1 = a[1] - a[3] / 2f
+        val ax2 = a[0] + a[2] / 2f; val ay2 = a[1] + a[3] / 2f
+        val bx1 = b[0] - b[2] / 2f; val by1 = b[1] - b[3] / 2f
+        val bx2 = b[0] + b[2] / 2f; val by2 = b[1] + b[3] / 2f
+        val iw = min(ax2, bx2) - max(ax1, bx1)
+        val ih = min(ay2, by2) - max(ay1, by1)
+        if (iw <= 0f || ih <= 0f) return 0f
+        val inter = iw * ih
+        return inter / (a[2] * a[3] + b[2] * b[3] - inter)
+    }
+
+    /** Sortie end-to-end [1, N, 6] : x1,y1,x2,y2,score,classe. */
+    private fun decodeEndToEnd(thr: Float, fw: Int, fh: Int, scale: Float, padX: Float, padY: Float): List<Detection> {
         val v = outValues
 
         // Coordonnées normalisées (0..1) ou en pixels (0..640) ? On le détecte.
