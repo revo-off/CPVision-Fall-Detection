@@ -1,0 +1,10 @@
+model,method,path,prep_s,error,size_mb,mAP50,mAP50-95,precision,recall,latency_ms,Δ mAP50-95,taille / FP32,accél. vs FP32
+FP32 (ONNX),FP32,bench_models\fp32.onnx,2.5,,9.85,0.0161,0.006,0.0223,0.0635,50.3,0.0,1.0,1.0
+FP32 (PyTorch),FP32,C:\Users\theom\Documents\Github\CPVision-Fall-Detection\runs\detect\bench_fp32\weights\best.pt,0.0,,5.45,0.0147,0.0051,0.0332,0.0767,,-0.0009,0.55,
+FP16 (ONNX),PTQ FP16,,0.0,Fail: [ONNXRuntimeError] : 1 : FAIL : Load model from bench_models\fp16.onnx failed:Type Error: Type (tensor(float)) of output arg (/model.11/Resize_output_,,,,,,,,,
+INT8 dynamique (ONNX),PTQ dynamique,bench_models\int8_dynamic.onnx,1.6,,2.84,0.0141,0.0049,0.0299,0.0767,618.5,-0.0011,0.29,0.08
+INT8 statique MinMax (ONNX),PTQ statique,bench_models\int8_static_minmax.onnx,13.3,,3.44,0.0162,0.0059,0.0259,0.0785,120.1,-0.0001,0.35,0.42
+INT8 statique Percentile (ONNX),PTQ statique,bench_models\int8_static_percentile.onnx,267.5,,3.44,0.0139,0.0052,0.021,0.078,121.1,-0.0008,0.35,0.42
+QAT (PyTorch),QAT,C:\Users\theom\Documents\Github\CPVision-Fall-Detection\runs\detect\bench_qat\weights\best.pt,428.4,,5.87,0.0577,0.0128,0.8004,0.0239,,0.0068,0.6,
+TFLite FP32,FP32 TFLite,,0.0,AssertionError: LiteRT export only supported on Linux x86 and macOS,,,,,,,,,
+TFLite INT8,PTQ INT8 TFLite,,0.0,AssertionError: LiteRT export only supported on Linux x86 and macOS,,,,,,,,,
